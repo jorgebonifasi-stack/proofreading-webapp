@@ -50,7 +50,7 @@ async function scrapeInkwell(consultationUrl, onProgress) {
     await page.goto(consultationUrl, { waitUntil: "networkidle2", timeout: 30000 });
 
     // Wait for page to load
-    await page.waitForTimeout(3000);
+    await new Promise(r => setTimeout(r, 3000));
 
     // Extract consultation data from the page
     onProgress?.("Extracting consultation data...");
@@ -70,7 +70,7 @@ async function scrapeInkwell(consultationUrl, onProgress) {
       const integrationsTab = await page.$('button:has-text("Integrations"), a:has-text("Integrations"), [role="tab"]:has-text("Integrations")');
       if (integrationsTab) {
         await integrationsTab.click();
-        await page.waitForTimeout(2000);
+        await new Promise(r => setTimeout(r, 2000));
       }
     } catch {
       onProgress?.("Could not find Integrations tab — continuing with main page data");
