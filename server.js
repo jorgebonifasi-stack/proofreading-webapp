@@ -23,6 +23,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
+// Serve index.html and static files from the same directory (flat layout)
 app.use(express.static(__dirname));
 
 // Store active jobs and results
@@ -161,7 +162,36 @@ async function runProofreadJob(jobId, dealId, inkwellUrl) {
     if (documents.length === 0) {
       throw new Error("No PDF documents found in the HubSpot deal");
     }
-    progress(`Found ${documents.length} document(s) in deal: ${dealName}`);
+
+    // Filter out instruction forms — only keep drafted documents (Will, LPA, SEV)
+    const draftedDocs = documents.filter(doc => {
+      const fname = doc.filename.toLowerCase();
+      // Exclude instruction forms and other non-draft documents
+      if (fname === "if" || fname === "if.pdf" || fname.startsWith("if.") || fname.startsWith("if-")) return false;
+      if (fname.includes("instruction") && fname.includes("form")) return false;
+      // Keep Arken-named documents (Name-TYPE-version pattern)
+      return true;
+    });
+
+    // Deduplicate: if multiple versions of same doc type exist, keep only the latest
+    // Arken filenames: Name-TYPE-VERSION-ENGROSSMENT-DD-MM-YYYY HH-MM-SS
+    const latestDocs = new Map();
+    for (const doc of draftedDocs) {
+      // Extract doc type key from filename (e.g. "Keith Lovesy-WILL", "Keith Lovesy-LPAHW")
+      const typeMatch = doc.filename.match(/^(.+?-(?:WILL|LPAHW|LPAPA|LPAPFA|SEV))/i);
+      const key = typeMatch ? typeMatch[1].toUpperCase() : doc.filename;
+      // Extract timestamp from filename for comparison
+      const dateMatch = doc.filename.match(/(\d{2})-(\d{2})-(\d{4})\s+(\d{2})-(\d{2})-(\d{2})/);
+      const timestamp = dateMatch
+        ? new Date(dateMatch[3], dateMatch[2]-1, dateMatch[1], dateMatch[4], dateMatch[5], dateMatch[6]).getTime()
+        : 0;
+      if (!latestDocs.has(key) || timestamp > latestDocs.get(key).timestamp) {
+        latestDocs.set(key, { doc, timestamp });
+      }
+    }
+    const finalDocs = Array.from(latestDocs.values()).map(v => v.doc);
+
+    progress(`Found ${finalDocs.length} document(s) to review (${documents.length - finalDocs.length} duplicates/non-drafts excluded)`);
 
     // Step 2: Scrape Inkwell (try Puppeteer, fallback to manual entry)
     progress("Step 2/5: Fetching instruction form data from Inkwell...");
@@ -179,9 +209,15 @@ async function runProofreadJob(jobId, dealId, inkwellUrl) {
     // Step 3: Extract and classify documents
     progress("Step 3/5: Extracting text from documents...");
     const processedDocs = [];
-    for (const doc of documents) {
+    for (const doc of finalDocs) {
       progress(`Processing ${doc.filename}...`);
-      const extracted = await extractText(doc.buffer);
+      let extracted;
+      try {
+        extracted = await extractText(doc.buffer);
+      } catch (pdfErr) {
+        progress(`  Skipping ${doc.filename}: ${pdfErr.message} (may be password-protected)`);
+        continue;
+      }
       const docType = classifyDocument(extracted.text, doc.filename);
       progress(`  Classified as: ${docType} (${extracted.numPages} pages)`);
 
@@ -372,8 +408,17 @@ function buildIFData(inkwellData, dealName) {
   };
 
   if (!inkwellData) {
-    // Fallback: try to parse client name from deal name
-    data.clientName = dealName.replace(/on behalf of/i, "").replace(/\s*-\s*.*/g, "").trim();
+    // Fallback: parse client name from deal name
+    // Deal names are like "Claire Witton on behalf of Keith Lovesy - WSL Website"
+    let name = dealName;
+    // If "on behalf of" exists, the actual client is AFTER it
+    const onBehalfMatch = name.match(/on\s+behalf\s+of\s+(.+?)(?:\s*-|$)/i);
+    if (onBehalfMatch) {
+      name = onBehalfMatch[1].trim();
+    } else {
+      name = name.replace(/\s*-\s*.*/g, "").trim();
+    }
+    data.clientName = name;
     return data;
   }
 
