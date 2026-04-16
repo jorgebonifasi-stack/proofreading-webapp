@@ -3,6 +3,11 @@
  */
 
 const pdfParse = require("pdf-parse");
+const { createWorker } = require("tesseract.js");
+const { execSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
 
 /**
  * Extract text from a PDF buffer
@@ -14,6 +19,82 @@ async function extractText(buffer) {
     numPages: data.numpages,
     info: data.info,
   };
+}
+
+/**
+ * Extract text from a scanned/handwritten PDF using OCR (tesseract.js).
+ * Converts each page to a PNG via pdftoppm, then runs OCR on each image.
+ * @param {Buffer} pdfBuffer - The PDF file as a buffer
+ * @param {function} [onProgress] - Optional progress callback (message string)
+ * @returns {Promise<{text: string, numPages: number, pageTexts: string[]}>}
+ */
+async function extractTextOCR(pdfBuffer, onProgress) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ocr-"));
+  const pdfPath = path.join(tmpDir, "input.pdf");
+  const imgPrefix = path.join(tmpDir, "page");
+
+  try {
+    // Write PDF to temp file
+    fs.writeFileSync(pdfPath, pdfBuffer);
+
+    // Convert PDF pages to PNG images using pdftoppm (poppler-utils)
+    // -r 300 = 300 DPI for good OCR quality on handwriting
+    // -png = output PNG format
+    if (onProgress) onProgress("  Converting IF pages to images (300 DPI)...");
+    try {
+      execSync(`pdftoppm -r 300 -png "${pdfPath}" "${imgPrefix}"`, {
+        timeout: 120000, // 2 min max
+        maxBuffer: 50 * 1024 * 1024, // 50MB stdout buffer
+      });
+    } catch (convErr) {
+      throw new Error(`PDF-to-image conversion failed: ${convErr.message}`);
+    }
+
+    // Find all generated page images (pdftoppm names them page-01.png, page-02.png, etc.)
+    const imageFiles = fs
+      .readdirSync(tmpDir)
+      .filter((f) => f.startsWith("page-") && f.endsWith(".png"))
+      .sort();
+
+    if (imageFiles.length === 0) {
+      throw new Error("pdftoppm produced no page images");
+    }
+
+    if (onProgress) onProgress(`  ${imageFiles.length} page image(s) generated, starting OCR...`);
+
+    // Create a single tesseract worker (reuse across pages for speed)
+    const worker = await createWorker("eng");
+
+    const pageTexts = [];
+    for (let i = 0; i < imageFiles.length; i++) {
+      const imgPath = path.join(tmpDir, imageFiles[i]);
+      if (onProgress && (i % 5 === 0 || i === imageFiles.length - 1)) {
+        onProgress(`  OCR page ${i + 1}/${imageFiles.length}...`);
+      }
+      const { data } = await worker.recognize(imgPath);
+      pageTexts.push(data.text);
+    }
+
+    await worker.terminate();
+
+    const fullText = pageTexts.join("\n--- PAGE BREAK ---\n");
+    if (onProgress) onProgress(`  OCR complete: ${imageFiles.length} pages, ${fullText.length} chars`);
+
+    return {
+      text: fullText,
+      numPages: imageFiles.length,
+      pageTexts,
+    };
+  } finally {
+    // Clean up temp files
+    try {
+      const files = fs.readdirSync(tmpDir);
+      for (const f of files) fs.unlinkSync(path.join(tmpDir, f));
+      fs.rmdirSync(tmpDir);
+    } catch (_) {
+      // Ignore cleanup errors
+    }
+  }
 }
 
 /**
@@ -447,6 +528,7 @@ function extractNames(text) {
 
 module.exports = {
   extractText,
+  extractTextOCR,
   classifyDocument,
   parseWillData,
   parseLPAData,
