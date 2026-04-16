@@ -22,7 +22,7 @@ const { generateReport } = require("./report");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: "5mb" }));
 // Serve index.html and static files from the same directory (flat layout)
 app.use(express.static(__dirname));
 
@@ -32,13 +32,20 @@ const jobs = new Map();
 /**
  * POST /api/proofread
  * Start a proofreading job
- * Body: { hubspotUrl, inkwellUrl }
+ * Body: { hubspotUrl, inkwellUrl?, ifData? }
+ * - ifData (optional): Pre-scraped instruction form data from Inkwell (via Cowork skill).
+ *   When provided, server-side Inkwell scraping is skipped entirely.
+ * - inkwellUrl is optional when ifData is provided.
  */
 app.post("/api/proofread", (req, res) => {
-  const { hubspotUrl, inkwellUrl } = req.body;
+  const { hubspotUrl, inkwellUrl, ifData } = req.body;
 
-  if (!hubspotUrl || !inkwellUrl) {
-    return res.status(400).json({ error: "Both HubSpot and Inkwell URLs are required" });
+  if (!hubspotUrl) {
+    return res.status(400).json({ error: "HubSpot URL is required" });
+  }
+
+  if (!inkwellUrl && !ifData) {
+    return res.status(400).json({ error: "Either an Inkwell URL or IF data must be provided" });
   }
 
   let dealId;
@@ -48,11 +55,14 @@ app.post("/api/proofread", (req, res) => {
     return res.status(400).json({ error: e.message });
   }
 
-  let consultationId;
-  try {
-    consultationId = extractConsultationId(inkwellUrl);
-  } catch (e) {
-    return res.status(400).json({ error: e.message });
+  let consultationId = null;
+  if (inkwellUrl) {
+    try {
+      consultationId = extractConsultationId(inkwellUrl);
+    } catch (e) {
+      // Not fatal if ifData is provided
+      if (!ifData) return res.status(400).json({ error: e.message });
+    }
   }
 
   const jobId = `job_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
@@ -65,8 +75,8 @@ app.post("/api/proofread", (req, res) => {
     startedAt: new Date().toISOString(),
   });
 
-  // Run the job asynchronously
-  runProofreadJob(jobId, dealId, inkwellUrl).catch((err) => {
+  // Run the job asynchronously, passing ifData if provided
+  runProofreadJob(jobId, dealId, inkwellUrl, ifData || null).catch((err) => {
     const job = jobs.get(jobId);
     if (job) {
       job.status = "error";
@@ -144,8 +154,12 @@ app.get("/api/proofread/:jobId/report", async (req, res) => {
 
 /**
  * Main proofreading job runner
+ * @param {string} jobId
+ * @param {string} dealId
+ * @param {string|null} inkwellUrl
+ * @param {object|null} externalIfData - Pre-scraped IF data from Cowork skill (skips Inkwell scraping)
  */
-async function runProofreadJob(jobId, dealId, inkwellUrl) {
+async function runProofreadJob(jobId, dealId, inkwellUrl, externalIfData) {
   const job = jobs.get(jobId);
   const token = process.env.HUBSPOT_API_TOKEN;
 
@@ -193,18 +207,32 @@ async function runProofreadJob(jobId, dealId, inkwellUrl) {
 
     progress(`Found ${docGroups.size} document type(s) across ${draftedDocs.length} file(s) (${documents.length - draftedDocs.length} non-drafts excluded)`);
 
-    // Step 2: Scrape Inkwell (try Puppeteer, fallback to manual entry)
-    progress("Step 2/5: Fetching instruction form data from Inkwell...");
-    let inkwellData = null;
-    try {
-      inkwellData = await scrapeInkwell(inkwellUrl, progress);
-    } catch (e) {
-      progress(`Inkwell scraping failed (${e.message}) — using basic data extraction`);
+    // Step 2: Get instruction form data
+    let ifData;
+    if (externalIfData && typeof externalIfData === "object" && externalIfData.clientName) {
+      // IF data provided externally (scraped by Cowork skill via Chrome)
+      progress("Step 2/5: Using pre-scraped IF data from Cowork...");
+      ifData = Object.assign(buildIFData(null, dealName), externalIfData);
+      progress(`Client: ${ifData.clientName} (from Cowork IF data)`);
+      if (ifData.reference) progress(`  Reference: ${ifData.reference}`);
+      if (ifData.executors?.length) progress(`  Executors: ${ifData.executors.map(e => e.name || e).join(", ")}`);
+      if (ifData.attorneys?.length) progress(`  Attorneys: ${ifData.attorneys.map(a => a.name || a).join(", ")}`);
+    } else {
+      // Fall back to server-side Inkwell scraping
+      progress("Step 2/5: Fetching instruction form data from Inkwell...");
+      let inkwellData = null;
+      if (inkwellUrl) {
+        try {
+          inkwellData = await scrapeInkwell(inkwellUrl, progress);
+        } catch (e) {
+          progress(`Inkwell scraping failed (${e.message}) — using basic data extraction`);
+        }
+      } else {
+        progress("No Inkwell URL provided — using deal name for client info");
+      }
+      ifData = buildIFData(inkwellData, dealName);
+      progress(`Client: ${ifData.clientName || dealName}`);
     }
-
-    // Build IF data structure from Inkwell data
-    const ifData = buildIFData(inkwellData, dealName);
-    progress(`Client: ${ifData.clientName || dealName}`);
 
     // Step 3: Extract and classify documents
     // For each doc type, try newest version first; if unreadable (e.g. password-protected), fall back to older versions
