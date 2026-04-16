@@ -81,14 +81,30 @@
 
       <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
         <div>
-          <label class="block text-sm font-semibold text-gray-600 mb-2">Inkwell Consultation URL</label>
-          <input type="text" id="inkwellUrl" placeholder="https://inkwell.death.tech/dashboard/consultations/..."
-            class="w-full" />
-        </div>
-        <div>
           <label class="block text-sm font-semibold text-gray-600 mb-2">HubSpot Deal URL</label>
           <input type="text" id="hubspotUrl" placeholder="https://app.hubspot.com/contacts/.../record/0-3/..."
             class="w-full" />
+        </div>
+        <div>
+          <label class="block text-sm font-semibold text-gray-600 mb-2">Inkwell Consultation URL <span class="font-normal text-gray-400">(optional if IF data provided)</span></label>
+          <input type="text" id="inkwellUrl" placeholder="https://inkwell.death.tech/dashboard/consultations/..."
+            class="w-full" />
+        </div>
+      </div>
+
+      <!-- IF Data Section -->
+      <div class="mb-6">
+        <div class="flex items-center gap-2 cursor-pointer select-none mb-2" onclick="toggleIfData()">
+          <svg id="ifDataChevron" class="w-4 h-4 text-gray-400 transform transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+          <label class="text-sm font-semibold text-gray-600 cursor-pointer">Instruction Form Data (JSON)</label>
+          <span id="ifDataBadge" class="hidden text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full font-medium">Provided</span>
+        </div>
+        <div id="ifDataSection" class="hidden">
+          <p class="text-xs text-gray-400 mb-2">Paste IF data scraped from Inkwell by the Cowork skill. When provided, server-side Inkwell scraping is skipped — this gives much better results.</p>
+          <textarea id="ifDataInput" rows="8" placeholder='{"clientName":"Keith Lovesy","reference":"OL-00R-1VT","address":"...","executors":[...],...}'
+            class="w-full border-2 border-gray-200 rounded-lg p-3 font-mono text-sm text-gray-700 focus:border-teal-500 focus:ring-2 focus:ring-teal-200 outline-none transition"
+            oninput="validateIfData()"></textarea>
+          <p id="ifDataError" class="text-xs text-red-500 mt-1 hidden"></p>
         </div>
       </div>
 
@@ -192,12 +208,62 @@
     let currentJobId = null;
     let currentStep = 0;
 
+    function toggleIfData() {
+      const section = document.getElementById('ifDataSection');
+      const chevron = document.getElementById('ifDataChevron');
+      if (section.classList.contains('hidden')) {
+        section.classList.remove('hidden');
+        chevron.style.transform = 'rotate(90deg)';
+      } else {
+        section.classList.add('hidden');
+        chevron.style.transform = '';
+      }
+    }
+
+    function validateIfData() {
+      const input = document.getElementById('ifDataInput').value.trim();
+      const errorEl = document.getElementById('ifDataError');
+      const badge = document.getElementById('ifDataBadge');
+      if (!input) {
+        errorEl.classList.add('hidden');
+        badge.classList.add('hidden');
+        return null;
+      }
+      try {
+        const parsed = JSON.parse(input);
+        if (!parsed.clientName) throw new Error('Missing "clientName" field');
+        errorEl.classList.add('hidden');
+        badge.classList.remove('hidden');
+        return parsed;
+      } catch (e) {
+        errorEl.textContent = e.message;
+        errorEl.classList.remove('hidden');
+        badge.classList.add('hidden');
+        return null;
+      }
+    }
+
     async function startProofread() {
       const inkwellUrl = document.getElementById('inkwellUrl').value.trim();
       const hubspotUrl = document.getElementById('hubspotUrl').value.trim();
+      const ifDataRaw = document.getElementById('ifDataInput').value.trim();
 
-      if (!inkwellUrl || !hubspotUrl) {
-        alert('Please enter both URLs');
+      // Parse IF data if provided
+      let ifData = null;
+      if (ifDataRaw) {
+        ifData = validateIfData();
+        if (!ifData) {
+          alert('IF data JSON is invalid. Please fix the errors or clear the field.');
+          return;
+        }
+      }
+
+      if (!hubspotUrl) {
+        alert('Please enter the HubSpot deal URL');
+        return;
+      }
+      if (!inkwellUrl && !ifData) {
+        alert('Please enter either an Inkwell URL or provide IF data JSON');
         return;
       }
 
@@ -216,10 +282,14 @@
       }
 
       try {
+        const payload = { hubspotUrl };
+        if (inkwellUrl) payload.inkwellUrl = inkwellUrl;
+        if (ifData) payload.ifData = ifData;
+
         const res = await fetch('/api/proofread', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ hubspotUrl, inkwellUrl }),
+          body: JSON.stringify(payload),
         });
 
         const data = await res.json();
@@ -449,6 +519,11 @@
     function resetForm() {
       document.getElementById('inkwellUrl').value = '';
       document.getElementById('hubspotUrl').value = '';
+      document.getElementById('ifDataInput').value = '';
+      document.getElementById('ifDataError').classList.add('hidden');
+      document.getElementById('ifDataBadge').classList.add('hidden');
+      document.getElementById('ifDataSection').classList.add('hidden');
+      document.getElementById('ifDataChevron').style.transform = '';
       document.getElementById('progressSection').classList.add('hidden');
       document.getElementById('resultsSection').classList.add('hidden');
       document.getElementById('headerStatus').textContent = 'Ready';
