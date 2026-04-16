@@ -129,6 +129,17 @@ app.get("/api/proofread/:jobId/status", (req, res) => {
 });
 
 /**
+ * GET /api/proofread/:jobId/debug-if
+ * View the raw extracted IF text (for debugging parser)
+ */
+app.get("/api/proofread/:jobId/debug-if", (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  res.setHeader("Content-Type", "text/plain");
+  res.send(job.debugIfText || "No IF text captured");
+});
+
+/**
  * GET /api/proofread/:jobId/report
  * Download the DOCX report
  */
@@ -226,6 +237,8 @@ async function runProofreadJob(jobId, dealId, inkwellUrl, externalIfData) {
       try {
         const ifExtracted = await extractText(ifDocument.buffer);
         progress(`  IF extracted: ${ifExtracted.numPages} pages, ${ifExtracted.text.length} chars`);
+        // Store raw text for debugging
+        job.debugIfText = ifExtracted.text;
         const parsedIF = parseInstructionForm(ifExtracted.text);
         // Merge parsed IF data with defaults
         ifData = Object.assign(buildIFData(null, dealName), parsedIF);
