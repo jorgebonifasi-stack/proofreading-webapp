@@ -173,25 +173,25 @@ async function runProofreadJob(jobId, dealId, inkwellUrl) {
       return true;
     });
 
-    // Deduplicate: if multiple versions of same doc type exist, keep only the latest
+    // Group documents by type, sorted newest-first per group
     // Arken filenames: Name-TYPE-VERSION-ENGROSSMENT-DD-MM-YYYY HH-MM-SS
-    const latestDocs = new Map();
+    const docGroups = new Map();
     for (const doc of draftedDocs) {
-      // Extract doc type key from filename (e.g. "Keith Lovesy-WILL", "Keith Lovesy-LPAHW")
       const typeMatch = doc.filename.match(/^(.+?-(?:WILL|LPAHW|LPAPA|LPAPFA|SEV))/i);
       const key = typeMatch ? typeMatch[1].toUpperCase() : doc.filename;
-      // Extract timestamp from filename for comparison
       const dateMatch = doc.filename.match(/(\d{2})-(\d{2})-(\d{4})\s+(\d{2})-(\d{2})-(\d{2})/);
       const timestamp = dateMatch
         ? new Date(dateMatch[3], dateMatch[2]-1, dateMatch[1], dateMatch[4], dateMatch[5], dateMatch[6]).getTime()
         : 0;
-      if (!latestDocs.has(key) || timestamp > latestDocs.get(key).timestamp) {
-        latestDocs.set(key, { doc, timestamp });
-      }
+      if (!docGroups.has(key)) docGroups.set(key, []);
+      docGroups.get(key).push({ doc, timestamp });
     }
-    const finalDocs = Array.from(latestDocs.values()).map(v => v.doc);
+    // Sort each group newest-first
+    for (const [, versions] of docGroups) {
+      versions.sort((a, b) => b.timestamp - a.timestamp);
+    }
 
-    progress(`Found ${finalDocs.length} document(s) to review (${documents.length - finalDocs.length} duplicates/non-drafts excluded)`);
+    progress(`Found ${docGroups.size} document type(s) across ${draftedDocs.length} file(s) (${documents.length - draftedDocs.length} non-drafts excluded)`);
 
     // Step 2: Scrape Inkwell (try Puppeteer, fallback to manual entry)
     progress("Step 2/5: Fetching instruction form data from Inkwell...");
@@ -207,45 +207,57 @@ async function runProofreadJob(jobId, dealId, inkwellUrl) {
     progress(`Client: ${ifData.clientName || dealName}`);
 
     // Step 3: Extract and classify documents
+    // For each doc type, try newest version first; if unreadable (e.g. password-protected), fall back to older versions
     progress("Step 3/5: Extracting text from documents...");
     const processedDocs = [];
-    for (const doc of finalDocs) {
-      progress(`Processing ${doc.filename}...`);
-      let extracted;
-      try {
-        extracted = await extractText(doc.buffer);
-      } catch (pdfErr) {
-        progress(`  Skipping ${doc.filename}: ${pdfErr.message} (may be password-protected)`);
-        continue;
-      }
-      const docType = classifyDocument(extracted.text, doc.filename);
-      progress(`  Classified as: ${docType} (${extracted.numPages} pages)`);
+    for (const [typeKey, versions] of docGroups) {
+      let success = false;
+      for (const { doc, timestamp } of versions) {
+        progress(`Processing ${doc.filename}...`);
+        let extracted;
+        try {
+          extracted = await extractText(doc.buffer);
+        } catch (pdfErr) {
+          progress(`  Cannot read ${doc.filename}: ${pdfErr.message} (may be password-protected)`);
+          if (versions.length > 1) {
+            progress(`  Trying an older version...`);
+          }
+          continue;
+        }
+        const docType = classifyDocument(extracted.text, doc.filename);
+        progress(`  Classified as: ${docType} (${extracted.numPages} pages)`);
 
-      let parsedData;
-      switch (docType) {
-        case "Will":
-          parsedData = parseWillData(extracted.text);
-          break;
-        case "LPA_HW":
-          parsedData = parseLPAData(extracted.text, "LPA_HW");
-          break;
-        case "LPA_PFA":
-          parsedData = parseLPAData(extracted.text, "LPA_PFA");
-          break;
-        case "SEV":
-          parsedData = parseSEVData(extracted.text);
-          break;
-        default:
-          parsedData = { rawText: extracted.text };
-      }
+        let parsedData;
+        switch (docType) {
+          case "Will":
+            parsedData = parseWillData(extracted.text);
+            break;
+          case "LPA_HW":
+            parsedData = parseLPAData(extracted.text, "LPA_HW");
+            break;
+          case "LPA_PFA":
+            parsedData = parseLPAData(extracted.text, "LPA_PFA");
+            break;
+          case "SEV":
+            parsedData = parseSEVData(extracted.text);
+            break;
+          default:
+            parsedData = { rawText: extracted.text };
+        }
 
-      processedDocs.push({
-        filename: doc.filename,
-        type: docType,
-        text: extracted.text,
-        numPages: extracted.numPages,
-        parsedData,
-      });
+        processedDocs.push({
+          filename: doc.filename,
+          type: docType,
+          text: extracted.text,
+          numPages: extracted.numPages,
+          parsedData,
+        });
+        success = true;
+        break; // Got a readable version for this type, move on
+      }
+      if (!success) {
+        progress(`  WARNING: All versions of ${typeKey} are unreadable — skipping entirely`);
+      }
     }
 
     // Step 4: Run checklists
