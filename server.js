@@ -13,18 +13,17 @@ require("dotenv").config();
 const express = require("express");
 const path = require("path");
 
-const { extractDealId, fetchDealDocuments } = require("./hubspot");
-const { extractConsultationId, scrapeInkwell, parseConsultationData } = require("./inkwell");
-const { extractText, classifyDocument, parseWillData, parseLPAData, parseSEVData } = require("./pdf-extract");
-const { runWillChecklist, runLPAChecklist, runSEVChecklist, determineOutcome } = require("./checklist");
-const { generateReport } = require("./report");
+const { extractDealId, fetchDealDocuments } = require("./lib/hubspot");
+const { extractConsultationId, scrapeInkwell, parseConsultationData } = require("./lib/inkwell");
+const { extractText, classifyDocument, parseWillData, parseLPAData, parseSEVData } = require("./lib/pdf-extract");
+const { runWillChecklist, runLPAChecklist, runSEVChecklist, determineOutcome } = require("./lib/checklist");
+const { generateReport } = require("./lib/report");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
-// Serve index.html and static files from the same directory (flat layout)
-app.use(express.static(__dirname));
+app.use(express.static(path.join(__dirname, "public")));
 
 // Store active jobs and results
 const jobs = new Map();
@@ -147,8 +146,7 @@ app.get("/api/proofread/:jobId/report", async (req, res) => {
  */
 async function runProofreadJob(jobId, dealId, inkwellUrl) {
   const job = jobs.get(jobId);
-const token = process.env.HUBSPOT_API_TOKEN;
-  console.log("TOKEN CHECK:", token ? "yes (" + token.substring(0, 10) + "...)" : "NO — env var missing!");
+  const token = process.env.HUBSPOT_API_TOKEN;
 
   const progress = (msg) => {
     job.progress.push(msg);
