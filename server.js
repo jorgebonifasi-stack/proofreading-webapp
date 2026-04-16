@@ -15,7 +15,7 @@ const path = require("path");
 
 const { extractDealId, fetchDealDocuments } = require("./hubspot");
 const { extractConsultationId, scrapeInkwell, parseConsultationData } = require("./inkwell");
-const { extractText, classifyDocument, parseWillData, parseLPAData, parseSEVData, parseInstructionForm } = require("./pdf-extract");
+const { extractText, extractTextOCR, classifyDocument, parseWillData, parseLPAData, parseSEVData, parseInstructionForm } = require("./pdf-extract");
 const { runWillChecklist, runLPAChecklist, runSEVChecklist, determineOutcome } = require("./checklist");
 const { generateReport } = require("./report");
 
@@ -232,21 +232,42 @@ async function runProofreadJob(jobId, dealId, inkwellUrl, externalIfData) {
       ifData = Object.assign(buildIFData(null, dealName), externalIfData);
       progress(`Client: ${ifData.clientName} (from Cowork IF data)`);
     } else if (ifDocument) {
-      // Parse the IF.pdf downloaded from HubSpot
-      progress("Step 2/5: Parsing instruction form (IF.pdf) from HubSpot...");
+      // Parse the IF.pdf downloaded from HubSpot using OCR (scanned/handwritten form)
+      progress("Step 2/5: Parsing instruction form (IF.pdf) via OCR...");
       try {
-        const ifExtracted = await extractText(ifDocument.buffer);
-        progress(`  IF extracted: ${ifExtracted.numPages} pages, ${ifExtracted.text.length} chars`);
-        // Store raw text for debugging
-        job.debugIfText = ifExtracted.text;
-        const parsedIF = parseInstructionForm(ifExtracted.text);
-        // Merge parsed IF data with defaults
-        ifData = Object.assign(buildIFData(null, dealName), parsedIF);
-        // Override clientName from IF if found, otherwise keep deal name parse
-        if (!ifData.clientName) {
+        // First try OCR (for scanned/handwritten forms)
+        const ocrResult = await extractTextOCR(ifDocument.buffer, progress);
+        progress(`  OCR extracted: ${ocrResult.numPages} pages, ${ocrResult.text.length} chars`);
+        // Store raw OCR text for debugging
+        job.debugIfText = ocrResult.text;
+
+        // Also get the pdf-parse text layer (has some printed labels that help with parsing)
+        let pdfParseText = "";
+        try {
+          const pdfResult = await extractText(ifDocument.buffer);
+          pdfParseText = pdfResult.text;
+        } catch (_) { /* ignore - OCR text is primary */ }
+
+        // Use OCR text as primary source, fall back to pdf-parse text for any missed fields
+        const parsedIF = parseInstructionForm(ocrResult.text);
+        const parsedFallback = pdfParseText ? parseInstructionForm(pdfParseText) : {};
+
+        // Merge: OCR takes priority, pdf-parse fills gaps
+        const merged = { ...parsedFallback, ...parsedIF };
+        // For arrays, prefer whichever has more entries
+        for (const key of ["executors", "attorneys", "guardians", "replacementAttorneys",
+                           "peopleToNotify", "specificGifts", "cashGifts", "charities",
+                           "residue", "propertyGifts", "exclusions"]) {
+          const ocrArr = parsedIF[key] || [];
+          const fallArr = parsedFallback[key] || [];
+          merged[key] = ocrArr.length >= fallArr.length ? ocrArr : fallArr;
+        }
+
+        ifData = Object.assign(buildIFData(null, dealName), merged);
+        if (!ifData.clientName || ifData.clientName.length < 3) {
           ifData.clientName = buildIFData(null, dealName).clientName;
         }
-        progress(`Client: ${ifData.clientName} (from IF.pdf)`);
+        progress(`Client: ${ifData.clientName} (from IF.pdf OCR)`);
         if (ifData.reference) progress(`  Reference: ${ifData.reference}`);
         if (ifData.dob) progress(`  DOB: ${ifData.dob}`);
         if (ifData.address) progress(`  Address: ${ifData.address}`);
@@ -256,7 +277,7 @@ async function runProofreadJob(jobId, dealId, inkwellUrl, externalIfData) {
         if (ifData.certificateProvider) progress(`  Certificate Provider: ${ifData.certificateProvider.name || ifData.certificateProvider}`);
         if (ifData.funeralWishes) progress(`  Funeral wishes: ${ifData.funeralWishes}`);
       } catch (ifErr) {
-        progress(`  IF parsing failed: ${ifErr.message} — falling back to deal name`);
+        progress(`  IF OCR/parsing failed: ${ifErr.message} — falling back to deal name`);
         ifData = buildIFData(null, dealName);
       }
     } else {
