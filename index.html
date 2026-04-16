@@ -191,6 +191,9 @@
             <button onclick="downloadReport()" class="btn-primary text-white font-semibold px-6 py-3 rounded-xl text-sm">
               Download DOCX
             </button>
+            <button onclick="viewDebugIF()" class="bg-yellow-50 text-yellow-700 font-semibold px-6 py-3 rounded-xl text-sm hover:bg-yellow-100 transition border border-yellow-200">
+              View IF Text
+            </button>
             <button onclick="resetForm()" class="bg-gray-100 text-gray-600 font-semibold px-6 py-3 rounded-xl text-sm hover:bg-gray-200 transition">
               New Review
             </button>
@@ -514,6 +517,11 @@
     async function downloadReport() {
       if (!currentJobId) return;
       window.open(`/api/proofread/${currentJobId}/report`, '_blank');
+    }
+
+    function viewDebugIF() {
+      if (!currentJobId) return;
+      window.open(`/api/proofread/${currentJobId}/debug-if`, '_blank');
     }
 
     function resetForm() {
