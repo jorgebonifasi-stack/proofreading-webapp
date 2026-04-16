@@ -13,17 +13,17 @@ require("dotenv").config();
 const express = require("express");
 const path = require("path");
 
-const { extractDealId, fetchDealDocuments } = require("./lib/hubspot");
-const { extractConsultationId, scrapeInkwell, parseConsultationData } = require("./lib/inkwell");
-const { extractText, classifyDocument, parseWillData, parseLPAData, parseSEVData } = require("./lib/pdf-extract");
-const { runWillChecklist, runLPAChecklist, runSEVChecklist, determineOutcome } = require("./lib/checklist");
-const { generateReport } = require("./lib/report");
+const { extractDealId, fetchDealDocuments } = require("./hubspot");
+const { extractConsultationId, scrapeInkwell, parseConsultationData } = require("./inkwell");
+const { extractText, classifyDocument, parseWillData, parseLPAData, parseSEVData } = require("./pdf-extract");
+const { runWillChecklist, runLPAChecklist, runSEVChecklist, determineOutcome } = require("./checklist");
+const { generateReport } = require("./report");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.static(__dirname));
 
 // Store active jobs and results
 const jobs = new Map();
