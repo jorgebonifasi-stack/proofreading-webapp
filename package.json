@@ -1,0 +1,17 @@
+{
+  "name": "octopus-proofreading-tool",
+  "version": "1.0.0",
+  "description": "Proofreading review tool for Octopus Legacy estate planning documents",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "docx": "^8.5.0",
+    "pdf-parse": "^1.1.1",
+    "puppeteer": "^22.6.0",
+    "dotenv": "^16.4.5"
+  }
+}
