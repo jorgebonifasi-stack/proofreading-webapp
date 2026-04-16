@@ -110,9 +110,14 @@
 
       <div class="flex items-center justify-between">
         <p class="text-xs text-gray-400">The tool will fetch documents, run the SOP checklist, and generate a report.</p>
-        <button id="startBtn" onclick="startProofread()" class="btn-primary text-white font-semibold px-8 py-3 rounded-xl text-sm">
-          Start Review
-        </button>
+        <div class="flex gap-3">
+          <button id="testOcrBtn" onclick="testOCR()" class="bg-yellow-50 text-yellow-700 font-semibold px-6 py-3 rounded-xl text-sm hover:bg-yellow-100 transition border border-yellow-200">
+            Test OCR Only
+          </button>
+          <button id="startBtn" onclick="startProofread()" class="btn-primary text-white font-semibold px-8 py-3 rounded-xl text-sm">
+            Start Review
+          </button>
+        </div>
       </div>
     </div>
 
@@ -203,9 +208,78 @@
     </div>
   </main>
 
+    <!-- OCR Test Result -->
+    <div id="ocrTestSection" class="hidden card p-8 mb-8">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-xl font-bold text-gray-800">OCR Test Result</h2>
+        <button onclick="document.getElementById('ocrTestSection').classList.add('hidden')" class="text-gray-400 hover:text-gray-600 text-lg">&times;</button>
+      </div>
+      <div id="ocrTestMeta" class="text-sm text-gray-500 mb-4"></div>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div>
+          <h3 class="text-sm font-semibold text-gray-600 mb-2">Parsed Data (what the checklist will use)</h3>
+          <pre id="ocrParsedData" class="bg-gray-50 rounded-lg p-4 max-h-96 overflow-auto font-mono text-xs text-gray-700 border"></pre>
+        </div>
+        <div>
+          <h3 class="text-sm font-semibold text-gray-600 mb-2">Raw OCR Text</h3>
+          <pre id="ocrRawText" class="bg-gray-50 rounded-lg p-4 max-h-96 overflow-auto font-mono text-xs text-gray-600 border whitespace-pre-wrap"></pre>
+        </div>
+      </div>
+      <div class="mt-4">
+        <h3 class="text-sm font-semibold text-gray-600 mb-2">Processing Log</h3>
+        <div id="ocrTestLog" class="bg-gray-50 rounded-lg p-4 max-h-32 overflow-auto font-mono text-xs text-gray-500"></div>
+      </div>
+    </div>
+  </main>
+
   <footer class="text-center py-6 text-sm text-gray-400">
     Octopus Legacy Proofreading Tool &middot; AI-assisted document review
   </footer>
+
+  <script>
+    async function testOCR() {
+      const hubspotUrl = document.getElementById('hubspotUrl').value.trim();
+      if (!hubspotUrl) { alert('Enter a HubSpot deal URL first'); return; }
+
+      const btn = document.getElementById('testOcrBtn');
+      btn.disabled = true;
+      btn.textContent = 'Running OCR... (1-3 min)';
+      document.getElementById('headerStatus').textContent = 'Testing OCR...';
+
+      try {
+        const res = await fetch('/api/test-ocr', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ hubspotUrl }),
+        });
+        const data = await res.json();
+        if (data.error && !data.ocrText) {
+          alert('OCR test failed: ' + data.error + (data.documents ? '\nFiles found: ' + data.documents.join(', ') : ''));
+          return;
+        }
+
+        // Show results
+        const section = document.getElementById('ocrTestSection');
+        section.classList.remove('hidden');
+        document.getElementById('ocrTestMeta').innerHTML =
+          `<strong>Deal:</strong> ${escapeHtml(data.dealName)} &nbsp;|&nbsp; ` +
+          `<strong>IF file:</strong> ${escapeHtml(data.ifFilename)} &nbsp;|&nbsp; ` +
+          `<strong>Pages:</strong> ${data.ocrPages} &nbsp;|&nbsp; ` +
+          `<strong>Chars:</strong> ${data.ocrChars?.toLocaleString()}`;
+        document.getElementById('ocrParsedData').textContent = JSON.stringify(data.parsedData, null, 2);
+        document.getElementById('ocrRawText').textContent = data.ocrText;
+        document.getElementById('ocrTestLog').innerHTML = (data.log || []).map(l => escapeHtml(l)).join('<br>');
+        section.scrollIntoView({ behavior: 'smooth' });
+        document.getElementById('headerStatus').textContent = 'OCR test complete';
+      } catch (e) {
+        alert('OCR test error: ' + e.message);
+        document.getElementById('headerStatus').textContent = 'Error';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Test OCR Only';
+      }
+    }
+  </script>
 
   <script>
     let currentJobId = null;

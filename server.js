@@ -140,6 +140,69 @@ app.get("/api/proofread/:jobId/debug-if", (req, res) => {
 });
 
 /**
+ * POST /api/test-ocr
+ * Standalone OCR test: fetches the IF from a HubSpot deal, runs OCR, returns raw text + parsed data.
+ * No checklist, no report — just extraction. Use this to verify OCR quality.
+ * Body: { hubspotUrl }
+ */
+app.post("/api/test-ocr", async (req, res) => {
+  const { hubspotUrl } = req.body;
+  if (!hubspotUrl) return res.status(400).json({ error: "hubspotUrl is required" });
+
+  let dealId;
+  try {
+    dealId = extractDealId(hubspotUrl);
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+
+  const token = process.env.HUBSPOT_API_TOKEN;
+  const log = [];
+  const progress = (msg) => { log.push(msg); console.log(`[test-ocr] ${msg}`); };
+
+  try {
+    progress("Fetching documents from HubSpot...");
+    const { dealName, documents } = await fetchDealDocuments(dealId, token, progress);
+
+    // Find the IF document
+    let ifDocument = null;
+    for (const doc of documents) {
+      const fname = doc.filename.toLowerCase();
+      if (fname === "if" || fname === "if.pdf" || fname.startsWith("if.") || fname.startsWith("if-") ||
+          (fname.includes("instruction") && fname.includes("form"))) {
+        ifDocument = doc;
+        break;
+      }
+    }
+
+    if (!ifDocument) {
+      return res.json({ error: "No IF document found in deal", log, documents: documents.map(d => d.filename) });
+    }
+
+    progress(`Found IF: ${ifDocument.filename} (${Math.round(ifDocument.buffer.length / 1024)}KB)`);
+
+    // Run OCR
+    progress("Running OCR (this may take 1-3 minutes for a full IF)...");
+    const ocrResult = await extractTextOCR(ifDocument.buffer, progress);
+
+    // Run the parser on OCR text
+    const parsed = parseInstructionForm(ocrResult.text);
+
+    res.json({
+      dealName,
+      ifFilename: ifDocument.filename,
+      ocrPages: ocrResult.numPages,
+      ocrChars: ocrResult.text.length,
+      ocrText: ocrResult.text,
+      parsedData: parsed,
+      log,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message, log });
+  }
+});
+
+/**
  * GET /api/proofread/:jobId/report
  * Download the DOCX report
  */
