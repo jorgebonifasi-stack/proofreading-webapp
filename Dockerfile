@@ -1,6 +1,6 @@
 FROM node:20-slim
 
-# Install Chrome dependencies for Puppeteer
+# Install Chrome dependencies for Puppeteer + poppler-utils for PDF-to-image (OCR pipeline)
 RUN apt-get update && apt-get install -y \
     chromium \
     fonts-liberation \
@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y \
     libxdamage1 \
     libxrandr2 \
     xdg-utils \
+    poppler-utils \
     --no-install-recommends && \
     rm -rf /var/lib/apt/lists/*
 
