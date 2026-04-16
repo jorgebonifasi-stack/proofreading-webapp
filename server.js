@@ -141,11 +141,11 @@ app.get("/api/proofread/:jobId/debug-if", (req, res) => {
 
 /**
  * POST /api/test-ocr
- * Standalone OCR test: fetches the IF from a HubSpot deal, runs OCR, returns raw text + parsed data.
- * No checklist, no report — just extraction. Use this to verify OCR quality.
+ * Start a standalone OCR test job: fetches the IF from a HubSpot deal, runs OCR,
+ * stores raw text + parsed data. Progress streamed via SSE at /api/test-ocr/:jobId/status.
  * Body: { hubspotUrl }
  */
-app.post("/api/test-ocr", async (req, res) => {
+app.post("/api/test-ocr", (req, res) => {
   const { hubspotUrl } = req.body;
   if (!hubspotUrl) return res.status(400).json({ error: "hubspotUrl is required" });
 
@@ -156,11 +156,79 @@ app.post("/api/test-ocr", async (req, res) => {
     return res.status(400).json({ error: e.message });
   }
 
+  const jobId = `ocr_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+  jobs.set(jobId, {
+    status: "running",
+    progress: [],
+    result: null,
+    error: null,
+    startedAt: new Date().toISOString(),
+  });
+
+  // Run OCR asynchronously
+  runOCRTestJob(jobId, dealId).catch((err) => {
+    const job = jobs.get(jobId);
+    if (job) { job.status = "error"; job.error = err.message; }
+  });
+
+  res.json({ jobId });
+});
+
+/**
+ * GET /api/test-ocr/:jobId/status
+ * SSE stream for OCR test job progress
+ */
+app.get("/api/test-ocr/:jobId/status", (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  let lastSent = 0;
+  const interval = setInterval(() => {
+    const j = jobs.get(req.params.jobId);
+    if (!j) { clearInterval(interval); res.end(); return; }
+
+    while (lastSent < j.progress.length) {
+      res.write(`data: ${JSON.stringify({ type: "progress", message: j.progress[lastSent] })}\n\n`);
+      lastSent++;
+    }
+
+    if (j.status === "complete") {
+      res.write(`data: ${JSON.stringify({ type: "complete", result: j.result })}\n\n`);
+      clearInterval(interval);
+      res.end();
+    } else if (j.status === "error") {
+      res.write(`data: ${JSON.stringify({ type: "error", error: j.error })}\n\n`);
+      clearInterval(interval);
+      res.end();
+    }
+  }, 500);
+
+  req.on("close", () => clearInterval(interval));
+});
+
+/**
+ * OCR test job runner
+ */
+async function runOCRTestJob(jobId, dealId) {
+  const job = jobs.get(jobId);
   const token = process.env.HUBSPOT_API_TOKEN;
-  const log = [];
-  const progress = (msg) => { log.push(msg); console.log(`[test-ocr] ${msg}`); };
+  const progress = (msg) => { job.progress.push(msg); console.log(`[${jobId}] ${msg}`); };
 
   try {
+    progress("OCR test started — Deal ID: " + dealId);
+
+    // Pre-flight check: is pdftoppm available?
+    try {
+      require("child_process").execSync("which pdftoppm");
+      progress("pdftoppm found ✓");
+    } catch (_) {
+      throw new Error("pdftoppm not found — the Dockerfile needs poppler-utils. Did you upload the updated Dockerfile?");
+    }
+
     progress("Fetching documents from HubSpot...");
     const { dealName, documents } = await fetchDealDocuments(dealId, token, progress);
 
@@ -176,31 +244,39 @@ app.post("/api/test-ocr", async (req, res) => {
     }
 
     if (!ifDocument) {
-      return res.json({ error: "No IF document found in deal", log, documents: documents.map(d => d.filename) });
+      throw new Error("No IF document found in deal. Files found: " + documents.map(d => d.filename).join(", "));
     }
 
     progress(`Found IF: ${ifDocument.filename} (${Math.round(ifDocument.buffer.length / 1024)}KB)`);
 
     // Run OCR
-    progress("Running OCR (this may take 1-3 minutes for a full IF)...");
+    progress("Starting OCR (this may take 1-3 minutes for a full IF)...");
     const ocrResult = await extractTextOCR(ifDocument.buffer, progress);
 
     // Run the parser on OCR text
+    progress("Parsing OCR text into structured data...");
     const parsed = parseInstructionForm(ocrResult.text);
 
-    res.json({
+    progress("Done! Parsed fields: " + Object.entries(parsed)
+      .filter(([, v]) => v && (typeof v === "string" ? v.length > 0 : Array.isArray(v) ? v.length > 0 : true))
+      .map(([k]) => k).join(", "));
+
+    job.result = {
       dealName,
       ifFilename: ifDocument.filename,
       ocrPages: ocrResult.numPages,
       ocrChars: ocrResult.text.length,
       ocrText: ocrResult.text,
       parsedData: parsed,
-      log,
-    });
+    };
+    job.status = "complete";
   } catch (e) {
-    res.status(500).json({ error: e.message, log });
+    progress(`ERROR: ${e.message}`);
+    job.status = "error";
+    job.error = e.message;
+    throw e;
   }
-});
+}
 
 /**
  * GET /api/proofread/:jobId/report

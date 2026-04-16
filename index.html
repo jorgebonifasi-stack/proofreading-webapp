@@ -305,11 +305,16 @@
             document.getElementById('headerStatus').textContent = 'Error';
           }
         };
-        evtSource.onerror = () => { evtSource.close(); };
+        evtSource.onerror = (e) => {
+          console.error('SSE error:', e);
+          addLog('SSE connection lost — check Railway logs for server errors', true);
+          evtSource.close();
+          btn.disabled = false;
+          btn.textContent = 'Test OCR Only';
+        };
       } catch (e) {
         addLog('ERROR: ' + e.message, true);
         document.getElementById('headerStatus').textContent = 'Error';
-      } finally {
         btn.disabled = false;
         btn.textContent = 'Test OCR Only';
       }
