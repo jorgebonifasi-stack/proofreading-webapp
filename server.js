@@ -147,7 +147,8 @@ app.get("/api/proofread/:jobId/report", async (req, res) => {
  */
 async function runProofreadJob(jobId, dealId, inkwellUrl) {
   const job = jobs.get(jobId);
-  const token = process.env.HUBSPOT_API_TOKEN;
+const token = process.env.HUBSPOT_API_TOKEN;
+  progress(`Token loaded: ${token ? "yes (" + token.substring(0, 10) + "...)" : "NO — env var missing!"}`);
 
   const progress = (msg) => {
     job.progress.push(msg);
