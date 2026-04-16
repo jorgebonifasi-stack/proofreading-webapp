@@ -15,7 +15,7 @@ const path = require("path");
 
 const { extractDealId, fetchDealDocuments } = require("./hubspot");
 const { extractConsultationId, scrapeInkwell, parseConsultationData } = require("./inkwell");
-const { extractText, classifyDocument, parseWillData, parseLPAData, parseSEVData } = require("./pdf-extract");
+const { extractText, classifyDocument, parseWillData, parseLPAData, parseSEVData, parseInstructionForm } = require("./pdf-extract");
 const { runWillChecklist, runLPAChecklist, runSEVChecklist, determineOutcome } = require("./checklist");
 const { generateReport } = require("./report");
 
@@ -177,15 +177,21 @@ async function runProofreadJob(jobId, dealId, inkwellUrl, externalIfData) {
       throw new Error("No PDF documents found in the HubSpot deal");
     }
 
-    // Filter out instruction forms — only keep drafted documents (Will, LPA, SEV)
-    const draftedDocs = documents.filter(doc => {
+    // Separate instruction form (IF) from drafted documents (Will, LPA, SEV)
+    let ifDocument = null;
+    const draftedDocs = [];
+    for (const doc of documents) {
       const fname = doc.filename.toLowerCase();
-      // Exclude instruction forms and other non-draft documents
-      if (fname === "if" || fname === "if.pdf" || fname.startsWith("if.") || fname.startsWith("if-")) return false;
-      if (fname.includes("instruction") && fname.includes("form")) return false;
-      // Keep Arken-named documents (Name-TYPE-version pattern)
-      return true;
-    });
+      if (fname === "if" || fname === "if.pdf" || fname.startsWith("if.") || fname.startsWith("if-") ||
+          (fname.includes("instruction") && fname.includes("form"))) {
+        ifDocument = doc; // Keep the IF for parsing
+      } else {
+        draftedDocs.push(doc);
+      }
+    }
+    if (ifDocument) {
+      progress(`Found instruction form: ${ifDocument.filename} (${Math.round(ifDocument.buffer.length / 1024)}KB)`);
+    }
 
     // Group documents by type, sorted newest-first per group
     // Arken filenames: Name-TYPE-VERSION-ENGROSSMENT-DD-MM-YYYY HH-MM-SS
@@ -214,21 +220,42 @@ async function runProofreadJob(jobId, dealId, inkwellUrl, externalIfData) {
       progress("Step 2/5: Using pre-scraped IF data from Cowork...");
       ifData = Object.assign(buildIFData(null, dealName), externalIfData);
       progress(`Client: ${ifData.clientName} (from Cowork IF data)`);
-      if (ifData.reference) progress(`  Reference: ${ifData.reference}`);
-      if (ifData.executors?.length) progress(`  Executors: ${ifData.executors.map(e => e.name || e).join(", ")}`);
-      if (ifData.attorneys?.length) progress(`  Attorneys: ${ifData.attorneys.map(a => a.name || a).join(", ")}`);
+    } else if (ifDocument) {
+      // Parse the IF.pdf downloaded from HubSpot
+      progress("Step 2/5: Parsing instruction form (IF.pdf) from HubSpot...");
+      try {
+        const ifExtracted = await extractText(ifDocument.buffer);
+        progress(`  IF extracted: ${ifExtracted.numPages} pages, ${ifExtracted.text.length} chars`);
+        const parsedIF = parseInstructionForm(ifExtracted.text);
+        // Merge parsed IF data with defaults
+        ifData = Object.assign(buildIFData(null, dealName), parsedIF);
+        // Override clientName from IF if found, otherwise keep deal name parse
+        if (!ifData.clientName) {
+          ifData.clientName = buildIFData(null, dealName).clientName;
+        }
+        progress(`Client: ${ifData.clientName} (from IF.pdf)`);
+        if (ifData.reference) progress(`  Reference: ${ifData.reference}`);
+        if (ifData.dob) progress(`  DOB: ${ifData.dob}`);
+        if (ifData.address) progress(`  Address: ${ifData.address}`);
+        if (ifData.maritalStatus) progress(`  Marital status: ${ifData.maritalStatus}`);
+        if (ifData.executors?.length) progress(`  Executors: ${ifData.executors.map(e => e.name || e).join(", ")}`);
+        if (ifData.attorneys?.length) progress(`  Attorneys: ${ifData.attorneys.map(a => a.name || a).join(", ")}`);
+        if (ifData.certificateProvider) progress(`  Certificate Provider: ${ifData.certificateProvider.name || ifData.certificateProvider}`);
+        if (ifData.funeralWishes) progress(`  Funeral wishes: ${ifData.funeralWishes}`);
+      } catch (ifErr) {
+        progress(`  IF parsing failed: ${ifErr.message} — falling back to deal name`);
+        ifData = buildIFData(null, dealName);
+      }
     } else {
-      // Fall back to server-side Inkwell scraping
-      progress("Step 2/5: Fetching instruction form data from Inkwell...");
+      // No IF document and no external data — try Inkwell scraping as last resort
+      progress("Step 2/5: No IF.pdf found — trying Inkwell scraping...");
       let inkwellData = null;
       if (inkwellUrl) {
         try {
           inkwellData = await scrapeInkwell(inkwellUrl, progress);
         } catch (e) {
-          progress(`Inkwell scraping failed (${e.message}) — using basic data extraction`);
+          progress(`Inkwell scraping failed (${e.message}) — using deal name only`);
         }
-      } else {
-        progress("No Inkwell URL provided — using deal name for client info");
       }
       ifData = buildIFData(inkwellData, dealName);
       progress(`Client: ${ifData.clientName || dealName}`);
