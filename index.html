@@ -1,476 +1,540 @@
-/**
- * Octopus Legacy Proofreading Tool — Server
- *
- * Express server that orchestrates:
- * 1. Inkwell scraping (consultation data, IF, IDs)
- * 2. HubSpot document fetching
- * 3. PDF text extraction & classification
- * 4. Checklist evaluation
- * 5. DOCX report generation
- */
-
-require("dotenv").config();
-const express = require("express");
-const path = require("path");
-
-const { extractDealId, fetchDealDocuments } = require("./hubspot");
-const { extractConsultationId, scrapeInkwell, parseConsultationData } = require("./inkwell");
-const { extractText, classifyDocument, parseWillData, parseLPAData, parseSEVData } = require("./pdf-extract");
-const { runWillChecklist, runLPAChecklist, runSEVChecklist, determineOutcome } = require("./checklist");
-const { generateReport } = require("./report");
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-app.use(express.json({ limit: "5mb" }));
-// Serve index.html and static files from the same directory (flat layout)
-app.use(express.static(__dirname));
-
-// Store active jobs and results
-const jobs = new Map();
-
-/**
- * POST /api/proofread
- * Start a proofreading job
- * Body: { hubspotUrl, inkwellUrl?, ifData? }
- * - ifData (optional): Pre-scraped instruction form data from Inkwell (via Cowork skill).
- *   When provided, server-side Inkwell scraping is skipped entirely.
- * - inkwellUrl is optional when ifData is provided.
- */
-app.post("/api/proofread", (req, res) => {
-  const { hubspotUrl, inkwellUrl, ifData } = req.body;
-
-  if (!hubspotUrl) {
-    return res.status(400).json({ error: "HubSpot URL is required" });
-  }
-
-  if (!inkwellUrl && !ifData) {
-    return res.status(400).json({ error: "Either an Inkwell URL or IF data must be provided" });
-  }
-
-  let dealId;
-  try {
-    dealId = extractDealId(hubspotUrl);
-  } catch (e) {
-    return res.status(400).json({ error: e.message });
-  }
-
-  let consultationId = null;
-  if (inkwellUrl) {
-    try {
-      consultationId = extractConsultationId(inkwellUrl);
-    } catch (e) {
-      // Not fatal if ifData is provided
-      if (!ifData) return res.status(400).json({ error: e.message });
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Proofreading Tool | Octopus Legacy</title>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css" rel="stylesheet">
+  <style>
+    :root {
+      --ol-navy: #1A3A5C;
+      --ol-teal: #0D9488;
+      --ol-light: #F0FDFA;
+      --ol-pass: #2E7D32;
+      --ol-fail: #C62828;
+      --ol-flag: #F57F17;
+      --ol-na: #757575;
     }
-  }
+    body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: #f8fafc; }
+    .gradient-header { background: linear-gradient(135deg, var(--ol-navy) 0%, #2d5f8a 100%); }
+    .card { background: white; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.06); }
+    .status-pass { color: var(--ol-pass); font-weight: 700; }
+    .status-fail { color: var(--ol-fail); font-weight: 700; }
+    .status-flag { color: var(--ol-flag); font-weight: 700; }
+    .status-na { color: var(--ol-na); font-weight: 600; }
+    .btn-primary { background: var(--ol-teal); transition: all 0.2s; }
+    .btn-primary:hover { background: #0f766e; transform: translateY(-1px); box-shadow: 0 4px 12px rgba(13,148,136,0.3); }
+    .btn-primary:disabled { background: #94a3b8; transform: none; box-shadow: none; cursor: not-allowed; }
+    .progress-step { transition: all 0.3s ease; }
+    .progress-step.active { color: var(--ol-teal); }
+    .progress-step.complete { color: var(--ol-pass); }
+    .progress-dot { width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 600; transition: all 0.3s; }
+    .progress-dot.pending { background: #e2e8f0; color: #94a3b8; }
+    .progress-dot.active { background: var(--ol-teal); color: white; animation: pulse 2s infinite; }
+    .progress-dot.complete { background: var(--ol-pass); color: white; }
+    .progress-dot.error { background: var(--ol-fail); color: white; }
+    .progress-line { height: 3px; background: #e2e8f0; flex: 1; margin: 0 8px; transition: background 0.3s; }
+    .progress-line.complete { background: var(--ol-pass); }
+    @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(13,148,136,0.4); } 50% { box-shadow: 0 0 0 8px rgba(13,148,136,0); } }
+    .log-entry { animation: slideIn 0.2s ease; }
+    @keyframes slideIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+    .outcome-badge { display: inline-block; padding: 6px 16px; border-radius: 8px; font-weight: 700; font-size: 14px; }
+    .outcome-approved { background: #e8f5e9; color: var(--ol-pass); }
+    .outcome-minor { background: #fff8e1; color: var(--ol-flag); }
+    .outcome-changes { background: #ffebee; color: var(--ol-fail); }
+    .stats-card { border-left: 4px solid; padding: 12px 16px; border-radius: 0 8px 8px 0; }
+    .check-table { width: 100%; border-collapse: separate; border-spacing: 0; }
+    .check-table th { background: var(--ol-navy); color: white; padding: 10px 12px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .check-table th:first-child { border-radius: 8px 0 0 0; }
+    .check-table th:last-child { border-radius: 0 8px 0 0; }
+    .check-table td { padding: 10px 12px; border-bottom: 1px solid #f1f5f9; font-size: 14px; }
+    .check-table tr:nth-child(even) td { background: #fafbfc; }
+    .check-table tr:hover td { background: #f0fdfa; }
+    .section-toggle { cursor: pointer; user-select: none; }
+    .section-toggle:hover { background: #f8fafc; }
+    .section-content { overflow: hidden; transition: max-height 0.3s ease; }
+    .octopus-logo { font-size: 28px; font-weight: 800; letter-spacing: -0.5px; }
+    input[type="text"] { border: 2px solid #e2e8f0; border-radius: 10px; padding: 12px 16px; transition: all 0.2s; font-size: 15px; }
+    input[type="text"]:focus { border-color: var(--ol-teal); box-shadow: 0 0 0 3px rgba(13,148,136,0.15); outline: none; }
+  </style>
+</head>
+<body>
+  <!-- Header -->
+  <header class="gradient-header text-white py-4 px-6 shadow-lg">
+    <div class="max-w-6xl mx-auto flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 bg-white bg-opacity-20 rounded-xl flex items-center justify-center text-xl">&#128027;</div>
+        <div>
+          <div class="octopus-logo">Octopus Legacy</div>
+          <div class="text-sm text-blue-200 opacity-80">Proofreading Tool</div>
+        </div>
+      </div>
+      <div class="text-sm text-blue-200 opacity-70" id="headerStatus">Ready</div>
+    </div>
+  </header>
 
-  const jobId = `job_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+  <main class="max-w-6xl mx-auto px-6 py-8">
+    <!-- Input Section -->
+    <div id="inputSection" class="card p-8 mb-8">
+      <h2 class="text-xl font-bold text-gray-800 mb-1">New Proofreading Review</h2>
+      <p class="text-gray-500 mb-6">Paste the Inkwell consultation URL and HubSpot deal URL to begin.</p>
 
-  jobs.set(jobId, {
-    status: "running",
-    progress: [],
-    result: null,
-    error: null,
-    startedAt: new Date().toISOString(),
-  });
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+        <div>
+          <label class="block text-sm font-semibold text-gray-600 mb-2">HubSpot Deal URL</label>
+          <input type="text" id="hubspotUrl" placeholder="https://app.hubspot.com/contacts/.../record/0-3/..."
+            class="w-full" />
+        </div>
+        <div>
+          <label class="block text-sm font-semibold text-gray-600 mb-2">Inkwell Consultation URL <span class="font-normal text-gray-400">(optional if IF data provided)</span></label>
+          <input type="text" id="inkwellUrl" placeholder="https://inkwell.death.tech/dashboard/consultations/..."
+            class="w-full" />
+        </div>
+      </div>
 
-  // Run the job asynchronously, passing ifData if provided
-  runProofreadJob(jobId, dealId, inkwellUrl, ifData || null).catch((err) => {
-    const job = jobs.get(jobId);
-    if (job) {
-      job.status = "error";
-      job.error = err.message;
-    }
-  });
+      <!-- IF Data Section -->
+      <div class="mb-6">
+        <div class="flex items-center gap-2 cursor-pointer select-none mb-2" onclick="toggleIfData()">
+          <svg id="ifDataChevron" class="w-4 h-4 text-gray-400 transform transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+          <label class="text-sm font-semibold text-gray-600 cursor-pointer">Instruction Form Data (JSON)</label>
+          <span id="ifDataBadge" class="hidden text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full font-medium">Provided</span>
+        </div>
+        <div id="ifDataSection" class="hidden">
+          <p class="text-xs text-gray-400 mb-2">Paste IF data scraped from Inkwell by the Cowork skill. When provided, server-side Inkwell scraping is skipped — this gives much better results.</p>
+          <textarea id="ifDataInput" rows="8" placeholder='{"clientName":"Keith Lovesy","reference":"OL-00R-1VT","address":"...","executors":[...],...}'
+            class="w-full border-2 border-gray-200 rounded-lg p-3 font-mono text-sm text-gray-700 focus:border-teal-500 focus:ring-2 focus:ring-teal-200 outline-none transition"
+            oninput="validateIfData()"></textarea>
+          <p id="ifDataError" class="text-xs text-red-500 mt-1 hidden"></p>
+        </div>
+      </div>
 
-  res.json({ jobId, dealId, consultationId });
-});
+      <div class="flex items-center justify-between">
+        <p class="text-xs text-gray-400">The tool will fetch documents, run the SOP checklist, and generate a report.</p>
+        <button id="startBtn" onclick="startProofread()" class="btn-primary text-white font-semibold px-8 py-3 rounded-xl text-sm">
+          Start Review
+        </button>
+      </div>
+    </div>
 
-/**
- * GET /api/proofread/:jobId/status
- * Get job status and progress (SSE stream)
- */
-app.get("/api/proofread/:jobId/status", (req, res) => {
-  const job = jobs.get(req.params.jobId);
-  if (!job) return res.status(404).json({ error: "Job not found" });
+    <!-- Progress Section -->
+    <div id="progressSection" class="hidden">
+      <!-- Progress Steps -->
+      <div class="card p-6 mb-6">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center flex-1" id="progressSteps">
+            <div class="progress-step flex flex-col items-center" data-step="1">
+              <div class="progress-dot pending" id="dot1">1</div>
+              <span class="text-xs mt-1 text-gray-500">HubSpot</span>
+            </div>
+            <div class="progress-line" id="line1"></div>
+            <div class="progress-step flex flex-col items-center" data-step="2">
+              <div class="progress-dot pending" id="dot2">2</div>
+              <span class="text-xs mt-1 text-gray-500">Inkwell</span>
+            </div>
+            <div class="progress-line" id="line2"></div>
+            <div class="progress-step flex flex-col items-center" data-step="3">
+              <div class="progress-dot pending" id="dot3">3</div>
+              <span class="text-xs mt-1 text-gray-500">Extract</span>
+            </div>
+            <div class="progress-line" id="line3"></div>
+            <div class="progress-step flex flex-col items-center" data-step="4">
+              <div class="progress-dot pending" id="dot4">4</div>
+              <span class="text-xs mt-1 text-gray-500">Checklist</span>
+            </div>
+            <div class="progress-line" id="line4"></div>
+            <div class="progress-step flex flex-col items-center" data-step="5">
+              <div class="progress-dot pending" id="dot5">5</div>
+              <span class="text-xs mt-1 text-gray-500">Report</span>
+            </div>
+          </div>
+        </div>
+      </div>
 
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
+      <!-- Log -->
+      <div class="card p-6 mb-6">
+        <h3 class="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-3">Activity Log</h3>
+        <div id="logContainer" class="bg-gray-50 rounded-lg p-4 max-h-48 overflow-y-auto font-mono text-sm text-gray-600 space-y-1">
+        </div>
+      </div>
+    </div>
 
-  let lastSent = 0;
-  const interval = setInterval(() => {
-    const j = jobs.get(req.params.jobId);
-    if (!j) {
-      clearInterval(interval);
-      res.end();
-      return;
-    }
+    <!-- Results Section -->
+    <div id="resultsSection" class="hidden">
+      <!-- Summary Card -->
+      <div class="card p-8 mb-6" id="summaryCard">
+        <div class="flex items-start justify-between mb-6">
+          <div>
+            <h2 class="text-xl font-bold text-gray-800 mb-1" id="resultTitle">Review Complete</h2>
+            <p class="text-gray-500" id="resultClient"></p>
+          </div>
+          <div id="overallOutcome"></div>
+        </div>
 
-    // Send new progress messages
-    while (lastSent < j.progress.length) {
-      res.write(`data: ${JSON.stringify({ type: "progress", message: j.progress[lastSent] })}\n\n`);
-      lastSent++;
-    }
+        <!-- Stats Row -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6" id="statsRow"></div>
 
-    if (j.status === "complete") {
-      res.write(`data: ${JSON.stringify({ type: "complete", result: j.result })}\n\n`);
-      clearInterval(interval);
-      res.end();
-    } else if (j.status === "error") {
-      res.write(`data: ${JSON.stringify({ type: "error", error: j.error })}\n\n`);
-      clearInterval(interval);
-      res.end();
-    }
-  }, 500);
+        <!-- Summary Text -->
+        <p class="text-gray-600 text-sm leading-relaxed" id="summaryText"></p>
+      </div>
 
-  req.on("close", () => clearInterval(interval));
-});
+      <!-- Document Results -->
+      <div id="documentResults" class="space-y-6"></div>
 
-/**
- * GET /api/proofread/:jobId/report
- * Download the DOCX report
- */
-app.get("/api/proofread/:jobId/report", async (req, res) => {
-  const job = jobs.get(req.params.jobId);
-  if (!job || job.status !== "complete" || !job.result) {
-    return res.status(404).json({ error: "Report not ready" });
-  }
+      <!-- Actions -->
+      <div class="card p-6 mt-6" id="actionsCard">
+        <div class="flex items-center justify-between">
+          <div>
+            <h3 class="font-bold text-gray-800">Download Report</h3>
+            <p class="text-sm text-gray-500">DOCX format with full checklist and recommended actions</p>
+          </div>
+          <div class="flex gap-3">
+            <button onclick="downloadReport()" class="btn-primary text-white font-semibold px-6 py-3 rounded-xl text-sm">
+              Download DOCX
+            </button>
+            <button onclick="resetForm()" class="bg-gray-100 text-gray-600 font-semibold px-6 py-3 rounded-xl text-sm hover:bg-gray-200 transition">
+              New Review
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
 
-  try {
-    const buffer = await generateReport(job.result);
-    const ref = job.result.consultation.reference || "report";
-    const date = new Date().toISOString().split("T")[0];
-    const filename = `Proofreading-Report-${ref}-${date}.docx`;
+  <footer class="text-center py-6 text-sm text-gray-400">
+    Octopus Legacy Proofreading Tool &middot; AI-assisted document review
+  </footer>
 
-    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
-    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-    res.send(buffer);
-  } catch (e) {
-    res.status(500).json({ error: `Report generation failed: ${e.message}` });
-  }
-});
+  <script>
+    let currentJobId = null;
+    let currentStep = 0;
 
-/**
- * Main proofreading job runner
- * @param {string} jobId
- * @param {string} dealId
- * @param {string|null} inkwellUrl
- * @param {object|null} externalIfData - Pre-scraped IF data from Cowork skill (skips Inkwell scraping)
- */
-async function runProofreadJob(jobId, dealId, inkwellUrl, externalIfData) {
-  const job = jobs.get(jobId);
-  const token = process.env.HUBSPOT_API_TOKEN;
-
-  const progress = (msg) => {
-    job.progress.push(msg);
-    console.log(`[${jobId}] ${msg}`);
-  };
-
-  try {
-    // Step 1: Fetch documents from HubSpot
-    progress("Step 1/5: Fetching documents from HubSpot...");
-    const { dealName, documents } = await fetchDealDocuments(dealId, token, progress);
-
-    if (documents.length === 0) {
-      throw new Error("No PDF documents found in the HubSpot deal");
-    }
-
-    // Filter out instruction forms — only keep drafted documents (Will, LPA, SEV)
-    const draftedDocs = documents.filter(doc => {
-      const fname = doc.filename.toLowerCase();
-      // Exclude instruction forms and other non-draft documents
-      if (fname === "if" || fname === "if.pdf" || fname.startsWith("if.") || fname.startsWith("if-")) return false;
-      if (fname.includes("instruction") && fname.includes("form")) return false;
-      // Keep Arken-named documents (Name-TYPE-version pattern)
-      return true;
-    });
-
-    // Group documents by type, sorted newest-first per group
-    // Arken filenames: Name-TYPE-VERSION-ENGROSSMENT-DD-MM-YYYY HH-MM-SS
-    const docGroups = new Map();
-    for (const doc of draftedDocs) {
-      const typeMatch = doc.filename.match(/^(.+?-(?:WILL|LPAHW|LPAPA|LPAPFA|SEV))/i);
-      const key = typeMatch ? typeMatch[1].toUpperCase() : doc.filename;
-      const dateMatch = doc.filename.match(/(\d{2})-(\d{2})-(\d{4})\s+(\d{2})-(\d{2})-(\d{2})/);
-      const timestamp = dateMatch
-        ? new Date(dateMatch[3], dateMatch[2]-1, dateMatch[1], dateMatch[4], dateMatch[5], dateMatch[6]).getTime()
-        : 0;
-      if (!docGroups.has(key)) docGroups.set(key, []);
-      docGroups.get(key).push({ doc, timestamp });
-    }
-    // Sort each group newest-first
-    for (const [, versions] of docGroups) {
-      versions.sort((a, b) => b.timestamp - a.timestamp);
-    }
-
-    progress(`Found ${docGroups.size} document type(s) across ${draftedDocs.length} file(s) (${documents.length - draftedDocs.length} non-drafts excluded)`);
-
-    // Step 2: Get instruction form data
-    let ifData;
-    if (externalIfData && typeof externalIfData === "object" && externalIfData.clientName) {
-      // IF data provided externally (scraped by Cowork skill via Chrome)
-      progress("Step 2/5: Using pre-scraped IF data from Cowork...");
-      ifData = Object.assign(buildIFData(null, dealName), externalIfData);
-      progress(`Client: ${ifData.clientName} (from Cowork IF data)`);
-      if (ifData.reference) progress(`  Reference: ${ifData.reference}`);
-      if (ifData.executors?.length) progress(`  Executors: ${ifData.executors.map(e => e.name || e).join(", ")}`);
-      if (ifData.attorneys?.length) progress(`  Attorneys: ${ifData.attorneys.map(a => a.name || a).join(", ")}`);
-    } else {
-      // Fall back to server-side Inkwell scraping
-      progress("Step 2/5: Fetching instruction form data from Inkwell...");
-      let inkwellData = null;
-      if (inkwellUrl) {
-        try {
-          inkwellData = await scrapeInkwell(inkwellUrl, progress);
-        } catch (e) {
-          progress(`Inkwell scraping failed (${e.message}) — using basic data extraction`);
-        }
+    function toggleIfData() {
+      const section = document.getElementById('ifDataSection');
+      const chevron = document.getElementById('ifDataChevron');
+      if (section.classList.contains('hidden')) {
+        section.classList.remove('hidden');
+        chevron.style.transform = 'rotate(90deg)';
       } else {
-        progress("No Inkwell URL provided — using deal name for client info");
+        section.classList.add('hidden');
+        chevron.style.transform = '';
       }
-      ifData = buildIFData(inkwellData, dealName);
-      progress(`Client: ${ifData.clientName || dealName}`);
     }
 
-    // Step 3: Extract and classify documents
-    // For each doc type, try newest version first; if unreadable (e.g. password-protected), fall back to older versions
-    progress("Step 3/5: Extracting text from documents...");
-    const processedDocs = [];
-    for (const [typeKey, versions] of docGroups) {
-      let success = false;
-      for (const { doc, timestamp } of versions) {
-        progress(`Processing ${doc.filename}...`);
-        let extracted;
-        try {
-          extracted = await extractText(doc.buffer);
-        } catch (pdfErr) {
-          progress(`  Cannot read ${doc.filename}: ${pdfErr.message} (may be password-protected)`);
-          if (versions.length > 1) {
-            progress(`  Trying an older version...`);
-          }
-          continue;
-        }
-        const docType = classifyDocument(extracted.text, doc.filename);
-        progress(`  Classified as: ${docType} (${extracted.numPages} pages)`);
+    function validateIfData() {
+      const input = document.getElementById('ifDataInput').value.trim();
+      const errorEl = document.getElementById('ifDataError');
+      const badge = document.getElementById('ifDataBadge');
+      if (!input) {
+        errorEl.classList.add('hidden');
+        badge.classList.add('hidden');
+        return null;
+      }
+      try {
+        const parsed = JSON.parse(input);
+        if (!parsed.clientName) throw new Error('Missing "clientName" field');
+        errorEl.classList.add('hidden');
+        badge.classList.remove('hidden');
+        return parsed;
+      } catch (e) {
+        errorEl.textContent = e.message;
+        errorEl.classList.remove('hidden');
+        badge.classList.add('hidden');
+        return null;
+      }
+    }
 
-        let parsedData;
-        switch (docType) {
-          case "Will":
-            parsedData = parseWillData(extracted.text);
-            break;
-          case "LPA_HW":
-            parsedData = parseLPAData(extracted.text, "LPA_HW");
-            break;
-          case "LPA_PFA":
-            parsedData = parseLPAData(extracted.text, "LPA_PFA");
-            break;
-          case "SEV":
-            parsedData = parseSEVData(extracted.text);
-            break;
-          default:
-            parsedData = { rawText: extracted.text };
-        }
+    async function startProofread() {
+      const inkwellUrl = document.getElementById('inkwellUrl').value.trim();
+      const hubspotUrl = document.getElementById('hubspotUrl').value.trim();
+      const ifDataRaw = document.getElementById('ifDataInput').value.trim();
 
-        processedDocs.push({
-          filename: doc.filename,
-          type: docType,
-          text: extracted.text,
-          numPages: extracted.numPages,
-          parsedData,
+      // Parse IF data if provided
+      let ifData = null;
+      if (ifDataRaw) {
+        ifData = validateIfData();
+        if (!ifData) {
+          alert('IF data JSON is invalid. Please fix the errors or clear the field.');
+          return;
+        }
+      }
+
+      if (!hubspotUrl) {
+        alert('Please enter the HubSpot deal URL');
+        return;
+      }
+      if (!inkwellUrl && !ifData) {
+        alert('Please enter either an Inkwell URL or provide IF data JSON');
+        return;
+      }
+
+      // Disable button, show progress
+      document.getElementById('startBtn').disabled = true;
+      document.getElementById('startBtn').textContent = 'Starting...';
+      document.getElementById('progressSection').classList.remove('hidden');
+      document.getElementById('resultsSection').classList.add('hidden');
+      document.getElementById('logContainer').innerHTML = '';
+      document.getElementById('headerStatus').textContent = 'Reviewing...';
+
+      // Reset progress dots
+      for (let i = 1; i <= 5; i++) {
+        document.getElementById(`dot${i}`).className = 'progress-dot pending';
+        if (i < 5) document.getElementById(`line${i}`).className = 'progress-line';
+      }
+
+      try {
+        const payload = { hubspotUrl };
+        if (inkwellUrl) payload.inkwellUrl = inkwellUrl;
+        if (ifData) payload.ifData = ifData;
+
+        const res = await fetch('/api/proofread', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
         });
-        success = true;
-        break; // Got a readable version for this type, move on
-      }
-      if (!success) {
-        progress(`  WARNING: All versions of ${typeKey} are unreadable — skipping entirely`);
+
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error);
+
+        currentJobId = data.jobId;
+        listenToProgress(data.jobId);
+      } catch (e) {
+        addLog('ERROR: ' + e.message, true);
+        document.getElementById('startBtn').disabled = false;
+        document.getElementById('startBtn').textContent = 'Start Review';
+        document.getElementById('headerStatus').textContent = 'Error';
       }
     }
 
-    // Step 4: Run checklists
-    progress("Step 4/5: Running proofreading checklists...");
-    const docResults = [];
-    for (const doc of processedDocs) {
-      progress(`  Checking ${doc.type}: ${doc.filename}...`);
-      let sections;
-      switch (doc.type) {
-        case "Will":
-          sections = runWillChecklist(doc.parsedData, ifData);
-          break;
-        case "LPA_HW":
-        case "LPA_PFA":
-          sections = runLPAChecklist(doc.parsedData, ifData);
-          break;
-        case "SEV":
-          sections = runSEVChecklist(doc.parsedData, ifData);
-          break;
-        default:
-          sections = [
-            {
-              title: "Unknown Document Type",
-              checks: [
-                {
-                  id: "U.1",
-                  item: "Document type could not be classified",
-                  status: "FLAG",
-                  notes: "Manual review required for unrecognised document",
-                },
-              ],
-            },
-          ];
-      }
+    function listenToProgress(jobId) {
+      const evtSource = new EventSource(`/api/proofread/${jobId}/status`);
 
-      const outcome = determineOutcome(sections);
-      const typeName = {
-        Will: "Will",
-        LPA_HW: "LPA (Health & Welfare)",
-        LPA_PFA: "LPA (Property & Financial Affairs)",
-        SEV: "Severance of Joint Tenancy",
-      }[doc.type] || doc.type;
+      evtSource.onmessage = (event) => {
+        const data = JSON.parse(event.data);
 
-      // Count results
-      let passes = 0, fails = 0, flags = 0, nas = 0;
-      for (const s of sections) {
-        for (const c of s.checks) {
-          if (c.status === "PASS") passes++;
-          else if (c.status === "FAIL") fails++;
-          else if (c.status === "FLAG") flags++;
-          else nas++;
+        if (data.type === 'progress') {
+          addLog(data.message);
+          updateProgressStep(data.message);
+        } else if (data.type === 'complete') {
+          evtSource.close();
+          completeStep(5);
+          showResults(data.result);
+          document.getElementById('startBtn').disabled = false;
+          document.getElementById('startBtn').textContent = 'Start Review';
+          document.getElementById('headerStatus').textContent = 'Complete';
+        } else if (data.type === 'error') {
+          evtSource.close();
+          addLog('ERROR: ' + data.error, true);
+          errorStep(currentStep || 1);
+          document.getElementById('startBtn').disabled = false;
+          document.getElementById('startBtn').textContent = 'Start Review';
+          document.getElementById('headerStatus').textContent = 'Error';
         }
-      }
-      progress(`  Result: ${outcome} (${passes} PASS, ${fails} FAIL, ${flags} FLAG, ${nas} N/A)`);
+      };
 
-      docResults.push({
-        name: `${typeName} of ${ifData.clientName || "Client"}`,
-        type: typeName,
-        filename: doc.filename,
-        outcome,
-        sections,
-        stats: { passes, fails, flags, nas },
-      });
+      evtSource.onerror = () => {
+        evtSource.close();
+      };
     }
 
-    // Step 5: Build final result
-    progress("Step 5/5: Compiling results...");
+    function updateProgressStep(message) {
+      const msg = message.toLowerCase();
+      if (msg.includes('step 1') || msg.includes('hubspot')) activateStep(1);
+      else if (msg.includes('step 2') || msg.includes('inkwell')) { completeStep(1); activateStep(2); }
+      else if (msg.includes('step 3') || msg.includes('extracting')) { completeStep(2); activateStep(3); }
+      else if (msg.includes('step 4') || msg.includes('checklist')) { completeStep(3); activateStep(4); }
+      else if (msg.includes('step 5') || msg.includes('compil')) { completeStep(4); activateStep(5); }
+    }
 
-    const allSections = docResults.flatMap((d) => d.sections);
-    const overallOutcome = determineOutcome(allSections);
+    function activateStep(n) {
+      currentStep = n;
+      document.getElementById(`dot${n}`).className = 'progress-dot active';
+      document.getElementById(`dot${n}`).innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10"/></svg>`;
+    }
 
-    // Build recommended actions from FAILs and significant FLAGs
-    const recommendedActions = [];
-    for (const doc of docResults) {
-      for (const section of doc.sections) {
-        for (const check of section.checks) {
-          if (check.status === "FAIL") {
-            recommendedActions.push({
-              document: doc.name,
-              action: `${check.item}: ${check.notes}`,
-              hubspotNote: check.notes,
-            });
+    function completeStep(n) {
+      document.getElementById(`dot${n}`).className = 'progress-dot complete';
+      document.getElementById(`dot${n}`).innerHTML = '&#10003;';
+      if (n < 5) document.getElementById(`line${n}`).className = 'progress-line complete';
+    }
+
+    function errorStep(n) {
+      document.getElementById(`dot${n}`).className = 'progress-dot error';
+      document.getElementById(`dot${n}`).innerHTML = '&#10007;';
+    }
+
+    function addLog(message, isError = false) {
+      const container = document.getElementById('logContainer');
+      const entry = document.createElement('div');
+      entry.className = 'log-entry';
+      const time = new Date().toLocaleTimeString();
+      entry.innerHTML = `<span class="text-gray-400">[${time}]</span> <span class="${isError ? 'text-red-600' : ''}">${escapeHtml(message)}</span>`;
+      container.appendChild(entry);
+      container.scrollTop = container.scrollHeight;
+    }
+
+    function showResults(result) {
+      document.getElementById('resultsSection').classList.remove('hidden');
+
+      // Title & client
+      document.getElementById('resultClient').textContent =
+        `${result.consultation.reference} | ${result.consultation.clientNames.join(', ')} | ${result.consultation.reviewDate}`;
+
+      // Overall outcome badge
+      const outcomeEl = document.getElementById('overallOutcome');
+      const outcomeClass = result.overallOutcome === 'APPROVED' ? 'outcome-approved'
+        : result.overallOutcome.includes('CHANGES REQUIRED') ? 'outcome-changes'
+        : 'outcome-minor';
+      outcomeEl.innerHTML = `<span class="outcome-badge ${outcomeClass}">${escapeHtml(result.overallOutcome)}</span>`;
+
+      // Stats
+      let totalP = 0, totalFa = 0, totalFl = 0, totalN = 0;
+      for (const doc of result.documents) {
+        totalP += doc.stats?.passes || 0;
+        totalFa += doc.stats?.fails || 0;
+        totalFl += doc.stats?.flags || 0;
+        totalN += doc.stats?.nas || 0;
+      }
+      document.getElementById('statsRow').innerHTML = `
+        <div class="stats-card bg-green-50" style="border-color:var(--ol-pass)">
+          <div class="text-2xl font-bold" style="color:var(--ol-pass)">${totalP}</div>
+          <div class="text-xs text-gray-500 uppercase font-semibold">Passed</div>
+        </div>
+        <div class="stats-card bg-red-50" style="border-color:var(--ol-fail)">
+          <div class="text-2xl font-bold" style="color:var(--ol-fail)">${totalFa}</div>
+          <div class="text-xs text-gray-500 uppercase font-semibold">Failed</div>
+        </div>
+        <div class="stats-card bg-yellow-50" style="border-color:var(--ol-flag)">
+          <div class="text-2xl font-bold" style="color:var(--ol-flag)">${totalFl}</div>
+          <div class="text-xs text-gray-500 uppercase font-semibold">Flagged</div>
+        </div>
+        <div class="stats-card bg-gray-50" style="border-color:var(--ol-na)">
+          <div class="text-2xl font-bold" style="color:var(--ol-na)">${totalN}</div>
+          <div class="text-xs text-gray-500 uppercase font-semibold">N/A</div>
+        </div>
+      `;
+
+      // Summary
+      document.getElementById('summaryText').textContent = result.summary;
+
+      // Document results
+      const docContainer = document.getElementById('documentResults');
+      docContainer.innerHTML = '';
+
+      for (const doc of result.documents) {
+        const docCard = document.createElement('div');
+        docCard.className = 'card overflow-hidden';
+
+        const docOutcomeClass = doc.outcome === 'APPROVED' ? 'outcome-approved'
+          : doc.outcome.includes('CHANGES REQUIRED') ? 'outcome-changes'
+          : 'outcome-minor';
+
+        let sectionsHtml = '';
+        for (const section of doc.sections) {
+          const sectionId = `section_${Math.random().toString(36).substring(2, 8)}`;
+          let checksHtml = '';
+          for (const check of section.checks) {
+            const statusClass = check.status === 'PASS' ? 'status-pass'
+              : check.status === 'FAIL' ? 'status-fail'
+              : check.status === 'FLAG' ? 'status-flag'
+              : 'status-na';
+            checksHtml += `
+              <tr>
+                <td class="font-mono text-gray-400">${escapeHtml(check.id)}</td>
+                <td>${escapeHtml(check.item)}</td>
+                <td class="text-center"><span class="${statusClass}">${escapeHtml(check.status)}</span></td>
+                <td class="text-gray-500 text-xs">${escapeHtml(check.notes || '')}</td>
+              </tr>
+            `;
           }
+
+          sectionsHtml += `
+            <div class="border-t border-gray-100">
+              <div class="section-toggle px-6 py-3 flex items-center justify-between" onclick="toggleSection('${sectionId}')">
+                <span class="font-semibold text-sm text-gray-700">${escapeHtml(section.title)}</span>
+                <span class="text-gray-400 text-xs">${section.checks.length} checks</span>
+              </div>
+              <div class="section-content px-6 pb-4" id="${sectionId}">
+                <table class="check-table">
+                  <thead><tr><th style="width:60px">#</th><th>Check Item</th><th style="width:80px">Status</th><th>Notes</th></tr></thead>
+                  <tbody>${checksHtml}</tbody>
+                </table>
+              </div>
+            </div>
+          `;
         }
+
+        docCard.innerHTML = `
+          <div class="px-6 py-5 flex items-center justify-between bg-gray-50 border-b">
+            <div>
+              <h3 class="font-bold text-gray-800">${escapeHtml(doc.name)}</h3>
+              <p class="text-xs text-gray-400 mt-1">${escapeHtml(doc.filename)}</p>
+            </div>
+            <span class="outcome-badge ${docOutcomeClass}">${escapeHtml(doc.outcome)}</span>
+          </div>
+          ${sectionsHtml}
+        `;
+
+        docContainer.appendChild(docCard);
+      }
+
+      // Show recommended actions if any
+      if (result.recommendedActions && result.recommendedActions.length > 0) {
+        const actionsHtml = result.recommendedActions.map(a => `
+          <div class="flex gap-3 items-start p-3 bg-red-50 rounded-lg">
+            <span class="text-red-500 font-bold text-lg mt-0.5">!</span>
+            <div>
+              <span class="font-semibold text-sm text-gray-800">${escapeHtml(a.document)}:</span>
+              <span class="text-sm text-gray-600">${escapeHtml(a.action)}</span>
+              ${a.hubspotNote ? `<p class="text-xs text-gray-400 mt-1 italic">HubSpot note: "${escapeHtml(a.hubspotNote)}"</p>` : ''}
+            </div>
+          </div>
+        `).join('');
+
+        const actionsCard = document.createElement('div');
+        actionsCard.className = 'card p-6 mb-6';
+        actionsCard.innerHTML = `
+          <h3 class="font-bold text-gray-800 mb-4">Recommended Actions</h3>
+          <div class="space-y-3">${actionsHtml}</div>
+        `;
+        docContainer.insertBefore(actionsCard, docContainer.firstChild);
       }
     }
 
-    // Build summary
-    const totalChecks = allSections.reduce((sum, s) => sum + s.checks.length, 0);
-    const totalFails = docResults.reduce((sum, d) => sum + d.stats.fails, 0);
-    const totalFlags = docResults.reduce((sum, d) => sum + d.stats.flags, 0);
-    const totalPasses = docResults.reduce((sum, d) => sum + d.stats.passes, 0);
-
-    const summary = `${docResults.length} document(s) reviewed for ${ifData.clientName || dealName}. ` +
-      `${totalChecks} checks performed: ${totalPasses} PASS, ${totalFails} FAIL, ${totalFlags} FLAG. ` +
-      (totalFails > 0
-        ? `${totalFails} item(s) require correction before approval.`
-        : totalFlags > 0
-        ? `${totalFlags} item(s) flagged for human review.`
-        : "All checks passed.");
-
-    const result = {
-      consultation: {
-        reference: ifData.reference || "N/A",
-        clientNames: [ifData.clientName || dealName],
-        address: ifData.address || "",
-        consultationType: ifData.consultationType || "single",
-        reviewDate: new Date().toISOString().split("T")[0],
-        reviewer: "Proofreading Tool (Automated)",
-      },
-      documents: docResults,
-      overallOutcome,
-      summary,
-      recommendedActions,
-    };
-
-    job.result = result;
-    job.status = "complete";
-    progress(`Complete! Overall outcome: ${overallOutcome}`);
-  } catch (e) {
-    progress(`ERROR: ${e.message}`);
-    job.status = "error";
-    job.error = e.message;
-    throw e;
-  }
-}
-
-/**
- * Build IF data structure from Inkwell scraped data
- */
-function buildIFData(inkwellData, dealName) {
-  const data = {
-    clientName: "",
-    reference: "",
-    address: "",
-    postcode: "",
-    dob: "",
-    maritalStatus: "",
-    consultationType: "single",
-    funeralWishes: "",
-    executors: [],
-    executorType: "",
-    attorneys: [],
-    decisionType: "",
-    certificateProvider: null,
-    replacementAttorneys: [],
-    peopleToNotify: [],
-    guardians: [],
-    specificGifts: [],
-    cashGifts: [],
-    charities: [],
-    residue: [],
-    trustType: "",
-    propertyGifts: [],
-    exclusions: [],
-    upcomingMarriage: false,
-    accessibilityNeeds: false,
-    minorBeneficiaries: false,
-    idVerifiedName: "",
-  };
-
-  if (!inkwellData) {
-    // Fallback: parse client name from deal name
-    // Deal names are like "Claire Witton on behalf of Keith Lovesy - WSL Website"
-    let name = dealName;
-    // If "on behalf of" exists, the actual client is AFTER it
-    const onBehalfMatch = name.match(/on\s+behalf\s+of\s+(.+?)(?:\s*-|$)/i);
-    if (onBehalfMatch) {
-      name = onBehalfMatch[1].trim();
-    } else {
-      name = name.replace(/\s*-\s*.*/g, "").trim();
+    function toggleSection(id) {
+      const el = document.getElementById(id);
+      if (el.style.maxHeight && el.style.maxHeight !== '0px') {
+        el.style.maxHeight = '0px';
+        el.style.paddingBottom = '0';
+      } else {
+        el.style.maxHeight = el.scrollHeight + 'px';
+        el.style.paddingBottom = '16px';
+      }
     }
-    data.clientName = name;
-    return data;
-  }
 
-  // Parse from Inkwell page text
-  const parsed = parseConsultationData(inkwellData.pageText);
-  Object.assign(data, parsed);
+    async function downloadReport() {
+      if (!currentJobId) return;
+      window.open(`/api/proofread/${currentJobId}/report`, '_blank');
+    }
 
-  return data;
-}
+    function resetForm() {
+      document.getElementById('inkwellUrl').value = '';
+      document.getElementById('hubspotUrl').value = '';
+      document.getElementById('ifDataInput').value = '';
+      document.getElementById('ifDataError').classList.add('hidden');
+      document.getElementById('ifDataBadge').classList.add('hidden');
+      document.getElementById('ifDataSection').classList.add('hidden');
+      document.getElementById('ifDataChevron').style.transform = '';
+      document.getElementById('progressSection').classList.add('hidden');
+      document.getElementById('resultsSection').classList.add('hidden');
+      document.getElementById('headerStatus').textContent = 'Ready';
+      currentJobId = null;
+      currentStep = 0;
+    }
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`\n  Octopus Legacy Proofreading Tool`);
-  console.log(`  Running at http://localhost:${PORT}\n`);
-});
+    function escapeHtml(str) {
+      if (!str) return '';
+      return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+  </script>
+</body>
+</html>
